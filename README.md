@@ -24,7 +24,10 @@ coopmat1 MMQ to RDNA3). When it does, this fork should shrink, not grow.
 
 Base: `LaurentZuijdwijk/llama.cpp` @ `11bfe8a6` (upstream `0190529e`, 2026-08-30) — the ROCmFPx
 formats, the batch-3..8 mat-vec path, `--spec-draft-adaptive`, and the RADV ≥ 25.3 coopmat LDS pad
-gate. On top of that, five carried patches (the swiglu fusion was dropped once upstream's #27220 superseded it):
+gate — and, since 2026-09-18, **upstream master itself**: the re-port is complete, the fork is no longer behind.
+On top of upstream there are five carried patches (the swiglu fusion was dropped once upstream's #27220
+superseded it) plus the fork's own ROCmFPx type plumbing, its delta-net concat-transpose kernel, and the
+UMA readback guard:
 
 | # | Patch | Author | Why it is here |
 |---|---|---|---|
@@ -66,6 +69,20 @@ correctness fix — and were briefly carried on that basis. They were then measu
 The lesson is on the branch now: a patch gets carried when a benchmark says so, not when the commit
 message is persuasive.
 
+## A failure mode every canary missed
+
+The first step-4 build passed the compiler, the ROCmFPx-type and adaptive-drafting canaries and a
+smoke request (it answered "pong"), and then benchmarked at **2.7 t/s** — Qwen3.8-27B on sixteen CPU
+threads. `--list-devices` printed `(none)`. Cause: the hunk cleanup had cut the only definition of
+`ggml_vk_wait_for_fence` (a definition count that mistook the header declaration for one), a shared
+library links fine with an undefined symbol, `dlopen` of `libggml-vulkan.so` then fails at runtime,
+and ggml registers the CPU backend alone — correct output, silently 25× slower.
+
+Two guards now sit in the build pipeline: `ldd -r` on every `libggml-*.so` must report no undefined
+symbol (`ldd` without `-r` does not resolve symbols and sees nothing), and every hop's smoke step
+requires `--list-devices` to show `Vulkan0` before any benchmark runs. If you build this tree
+yourself, run both.
+
 **Deliberately not carried:** everything DeepSeek-V4-specific (not run here), the DFlash2 draft-cache
 patches (DFlash2 loses to the baked MTP head on these cards, and it cannot be combined with it), the
 `mul_mat_id` IQ-type pipelines (second half of a two-commit series whose first half does not apply,
@@ -82,7 +99,9 @@ greedy, median of 2 — patches 1-6 against the same base without them:
 | ROCmFPx base (`11bfe8a6`, upstream 08-30) | 75.6 | 106.5 | 129.3 | 818.6 t/s |
 | the six patches, at that base | 76.2 | 107.7 | 130.6 | **843.6 t/s** |
 | base moved to upstream 09-09 (step 1) | 72.1 | 103.9 | 129.8 | 841.6 t/s |
-| **this branch** (through #25773, step 2) | 71.9 | 104.3 | 130.0 | **859.6 t/s** |
+| through #25773 (step 2) | 71.9 | 104.3 | 130.0 | 859.6 t/s |
+| base moved to upstream 09-17 (step 3) | 74.4 | 106.1 | 130.4 | 864.3 t/s |
+| **this branch** (upstream master 09-18, step 4) | 74.1 | 105.7 | 129.9 | 868.1 t/s |
 
 The 5 % prose / 4 % json decode this branch gives up against the row above is **entirely** upstream
 [#28068](https://github.com/ggml-org/llama.cpp/pull/28068), isolated by building with it reverted
@@ -92,6 +111,11 @@ The 5 % prose / 4 % json decode this branch gives up against the row above is **
 (6.9218 vs 6.9211, ~1 % of one standard error), so the cost buys fidelity that wikitext cannot see.
 It stays: reverting would mean carrying a divergence from upstream on model correctness, forever,
 at every future hop.
+
+Step 3 (upstream to 09-17) won back part of the #28068 cost: +3.0 % prose / +1.8 % json over step 2 in one
+session, with upstream's #28457 small-M kernels (the MTP verify shape) as the visible cause — the prose hash
+changes, json's does not. Step 4 (current master, through the Vulkan source split): decode and prefill within noise of step 3 (−0.4…−0.8 %), output byte-identical on all four
+presets. The re-port is complete; the fork is at upstream master.
 
 Step 2 (#25773, upstream's spec-constant matmul rewrite) then cost nothing: decode within noise of
 step 1, prefill +1.9 %, output byte-identical on all four presets. The ROCmFPx types now register
@@ -125,11 +149,10 @@ Measured merge cost from this branch, 2026-09-18:
 
 | merge target | conflicting files | conflict hunks | status |
 |---|---|---|---|
-| upstream just before #25773 (09-09) | 10 | 26 | **done** — see "Measured" |
+| upstream just before #25773 (09-09) | 10 | 26 | **done** |
 | **at #25773** (spec-constant matmul) | 2 | 19 | **done** — registration work, not shader work |
-| just before #28732 (09-17) | 1 | 1 | `src/CMakeLists.txt` only |
-| at #28732 (Vulkan source split) | 2 | 6 | struct/buffers moved to headers; keep the fork's UMA readback guard and concat-transpose |
-| current master (09-18) | 4 | 8 | + `mul_mmq_shmem_types.glsl`, generator mmq list |
+| just before #28732 (09-17) | 1 | 1 | **done** — `src/CMakeLists.txt` only |
+| current master 44be98f0 (09-18), through the source split | 3 | 7 | **merged** — **done** — benchmarked, see "Measured" |
 
 (Costs re-measured from each adopted tip; the original single-jump estimate was 13 files / 47 hunks.)
 
@@ -143,6 +166,23 @@ a step that costs decode is a step to stop and understand, not to push through. 
 end is that this tree can take upstream PRs *and* the FP4 types at once, which is what the separate
 patched `llama-server` in [llama-swap-docker-amd](https://github.com/SelfRef/llama-swap-docker-amd)
 exists to work around today. Once it can, that binary goes back to being stock upstream.
+
+## Phase 2: one binary
+
+With the base at master, the tree can take upstream PRs — the thing the separate patched `llama-server`
+in [llama-swap-docker-amd](https://github.com/SelfRef/llama-swap-docker-amd) exists to work around.
+Measured against master on 2026-09-18, of that image's 13 `LLAMA_PATCHES` **eleven merge cleanly**;
+two conflict in one hunk each and need a rebase onto this tree:
+
+| PR | what it is | state |
+|---|---|---|
+| #27952 | int8 coopmat1 MMQ for RDNA3 — the measured RDNA3 prefill win (+4.6 % dense / +18.5 % MoE) | 1 hunk vs master, in the int-shmem warptile selection |
+| #25666 | no MMVQ on speculative-decode steps — `qwen38-bart`'s draft acceptance | 1 hunk vs master, a device-tuning constant block |
+| #28243 | Qwen3.8-Flash-Next MTP head | the image's local `28243-rebased.patch` no longer applies (2 of 19 files), but the PR head itself now merges cleanly — use the PR ref |
+
+Once those land here, `llama-server` in the image goes back to byte-for-byte upstream and this fork is
+the one binary for every entry. Not before: that order was chosen so no production entry ever sees a
+regression window.
 
 ## Build
 
