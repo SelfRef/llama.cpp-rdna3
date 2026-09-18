@@ -47,18 +47,25 @@ line. All sources are MIT, as is this fork.
 ## Tried and parked
 
 Two further patches by the same authors looked right on inspection — one numerical, one a
-correctness fix — and were carried on that basis. Measured on a 7900 XTX they cost **-23 % prose /
--24 % json decode** against the six above, and changed the greedy output hash:
+correctness fix — and were briefly carried on that basis. They were then measured, and bisected:
 
-| | prose | json | refactor | prefill @32k |
-|---|---|---|---|---|
-| patches 1-6 | 75.7 | 107.2 | 129.8 | 841.9 |
-| + FA MMQ fp32 narrowing + full MTP-rollback checkpoints | **58.4** | **80.5** | 120.2 | 806.4 |
+| | prose | json | refactor | prefill @32k | output |
+|---|---|---|---|---|---|
+| `rdna3` (patches 1-6) | 76.2 | 107.7 | 130.6 | 843.6 | matches base |
+| `carry/vulkan-fa-mmq-fp32` (+ FA MMQ fp32 narrowing) | 76.0 | 107.7 | 130.4 | 841.4 | matches base |
+| + `carry/mtp-full-checkpoints` as well | **58.4** | **80.5** | 120.2 | 806.4 | **differs** |
 
-Draft acceptance went *up* (53 % vs 44 % on prose) while throughput fell, which points at the
-rollback path paying on every accepted token. They live on `carry/vulkan-fa-mmq-fp32` and
-`carry/mtp-full-checkpoints`, plus `test/fa-mmq-fp32` (= `rdna3` + the first of the two) so the pair
-can be bisected without disturbing the branch. Do not merge either without a benchmark.
+- **`vulkan: scale the FA MMQ dot product in fp32 before narrowing` — neutral, parked.** It costs
+  nothing and changes nothing on an FP4 model, which is expected: MMQ is the integer-dot path the
+  K-quants take, not this one. It is worth re-testing on a K-quant, and it is a reasonable candidate
+  once the base moves up far enough that one binary serves every model.
+- **`Reapply "common: use full checkpoints for MTP rollback"` — rejected.** On its own it accounts
+  for the whole **-23 % prose / -24 % json** and it **changes the greedy output**, on a path that is
+  supposed to be lossless. Draft acceptance rises (53 % vs 44 %) while throughput falls, i.e. the
+  rollback is paying on every accepted token. Do not merge without understanding the output change.
+
+The lesson is on the branch now: a patch gets carried when a benchmark says so, not when the commit
+message is persuasive.
 
 **Deliberately not carried:** everything DeepSeek-V4-specific (not run here), the DFlash2 draft-cache
 patches (DFlash2 loses to the baked MTP head on these cards, and it cannot be combined with it), the
@@ -74,7 +81,7 @@ greedy, median of 2 — patches 1-6 against the same base without them:
 | | prose | json | refactor | prefill @32k |
 |---|---|---|---|---|
 | base (`11bfe8a6`) | 75.6 | 106.5 | 129.3 | 818.6 t/s |
-| **+ patches 1-6** | 75.7 | 107.2 | 129.8 | **841.9 t/s** |
+| **this branch** | 76.2 | 107.7 | 130.6 | **843.6 t/s** |
 
 Decode is a tie; prefill is **+2.8 % at 32k** and +1.3-3.3 % on short prompts, with identical VRAM
 and **byte-identical greedy output**. `LLAMA_KV_ROW_PAD=256` measured null on this card and cost
