@@ -24,14 +24,13 @@ coopmat1 MMQ to RDNA3). When it does, this fork should shrink, not grow.
 
 Base: `LaurentZuijdwijk/llama.cpp` @ `11bfe8a6` (upstream `0190529e`, 2026-08-30) — the ROCmFPx
 formats, the batch-3..8 mat-vec path, `--spec-draft-adaptive`, and the RADV ≥ 25.3 coopmat LDS pad
-gate. On top of that, six commits:
+gate. On top of that, five carried patches (the swiglu fusion was dropped once upstream's #27220 superseded it):
 
 | # | Patch | Author | Why it is here |
 |---|---|---|---|
 | 1 | `vulkan: hoist the coopmat1 FA P-fragment load out of the hsv_tile loop` | Nathan Wilson | coopmat1 flash-attention is the path RDNA3 actually takes |
 | 2 | `vulkan: store coopmat1 FA Psh query-major so the GEMM2 A load vectorizes` | Nathan Wilson | same |
 | 3 | `vulkan: pin a 32-wide subgroup for coopmat1 FA where narrowing is free` | Nathan Wilson | same |
-| 4 | `vulkan: fuse silu(x)*y into the existing swiglu-split pipeline` | Nathan Wilson | one less pass over the FFN activations |
 | 5 | `server: keep speculative checkpoints on device` | Gaetan Puleo | MTP speculative decoding is on for every model we run |
 | 6 | `llama: opt-in KV cache row padding to defeat power-of-2 channel aliasing` | Nathan Wilson | **opt-in, off by default** (`LLAMA_KV_ROW_PAD`); measured null on gfx1100, kept as a knob for gfx1151 |
 
@@ -82,7 +81,8 @@ greedy, median of 2 — patches 1-6 against the same base without them:
 |---|---|---|---|---|
 | ROCmFPx base (`11bfe8a6`, upstream 08-30) | 75.6 | 106.5 | 129.3 | 818.6 t/s |
 | the six patches, at that base | 76.2 | 107.7 | 130.6 | **843.6 t/s** |
-| **this branch** (base moved to upstream 09-09) | 72.1 | 103.9 | 129.8 | 841.6 t/s |
+| base moved to upstream 09-09 (step 1) | 72.1 | 103.9 | 129.8 | 841.6 t/s |
+| **this branch** (through #25773, step 2) | 71.9 | 104.3 | 130.0 | **859.6 t/s** |
 
 The 5 % prose / 4 % json decode this branch gives up against the row above is **entirely** upstream
 [#28068](https://github.com/ggml-org/llama.cpp/pull/28068), isolated by building with it reverted
@@ -91,7 +91,15 @@ The 5 % prose / 4 % json decode this branch gives up against the row above is **
 `q_conv` and `k_conv` in all 48 GDN layers — two ops where there was one. Perplexity is unmoved
 (6.9218 vs 6.9211, ~1 % of one standard error), so the cost buys fidelity that wikitext cannot see.
 It stays: reverting would mean carrying a divergence from upstream on model correctness, forever,
-at every future hop. **A fused eps-aware `l2_norm` in ggml would recover most of the 5 % — that is
+at every future hop.
+
+Step 2 (#25773, upstream's spec-constant matmul rewrite) then cost nothing: decode within noise of
+step 1, prefill +1.9 %, output byte-identical on all four presets. The ROCmFPx types now register
+through upstream's own per-type `X(TYPE, tstr)` idiom (`FOR_EACH_ROCMFPX_TYPE`) instead of the
+fork's macro-per-type scheme, and the fork's f16-B routing — which was **on by default**, not an
+unused knob — is replaced by upstream doing the same f32→f16 B conversion unconditionally on
+coopmat1. Two fork tuning knobs went with it (`GGML_VK_DENSE_WAVE32`, off and measured −5.8 %;
+`GGML_VK_MMID_WG256/WAVE32`, off and never measured). **A fused eps-aware `l2_norm` in ggml would recover most of the 5 % — that is
 the first thing this fork should try to upstream.**
 
 Decode is a tie; prefill is **+2.8 % at 32k** and +1.3-3.3 % on short prompts, with identical VRAM
@@ -115,12 +123,15 @@ separate files ([#28732](https://github.com/ggml-org/llama.cpp/pull/28732)).
 
 Measured merge cost from this branch, 2026-09-18:
 
-| merge target | conflicting files | conflict hunks |
-|---|---|---|
-| upstream just before #25773 (09-09) | 10 | 26 |
-| **at #25773** | 11 | **41** |
-| just before #28732 (09-17) | 12 | 44 |
-| current master (09-18) | 13 | 47 |
+| merge target | conflicting files | conflict hunks | status |
+|---|---|---|---|
+| upstream just before #25773 (09-09) | 10 | 26 | **done** — see "Measured" |
+| **at #25773** (spec-constant matmul) | 2 | 19 | **done** — registration work, not shader work |
+| just before #28732 (09-17) | 1 | 1 | `src/CMakeLists.txt` only |
+| at #28732 (Vulkan source split) | 2 | 6 | struct/buffers moved to headers; keep the fork's UMA readback guard and concat-transpose |
+| current master (09-18) | 4 | 8 | + `mul_mmq_shmem_types.glsl`, generator mmq list |
+
+(Costs re-measured from each adopted tip; the original single-jump estimate was 13 files / 47 hunks.)
 
 So roughly **half the work is the single #25773 step**, and it is exactly where the ROCmFPx types
 have to be re-expressed in the new `create_mm_pipelines` / spec-constant scheme rather than merged.
