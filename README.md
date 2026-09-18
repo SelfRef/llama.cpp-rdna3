@@ -80,8 +80,19 @@ greedy, median of 2 — patches 1-6 against the same base without them:
 
 | | prose | json | refactor | prefill @32k |
 |---|---|---|---|---|
-| base (`11bfe8a6`) | 75.6 | 106.5 | 129.3 | 818.6 t/s |
-| **this branch** | 76.2 | 107.7 | 130.6 | **843.6 t/s** |
+| ROCmFPx base (`11bfe8a6`, upstream 08-30) | 75.6 | 106.5 | 129.3 | 818.6 t/s |
+| the six patches, at that base | 76.2 | 107.7 | 130.6 | **843.6 t/s** |
+| **this branch** (base moved to upstream 09-09) | 72.1 | 103.9 | 129.8 | 841.6 t/s |
+
+The 5 % prose / 4 % json decode this branch gives up against the row above is **entirely** upstream
+[#28068](https://github.com/ggml-org/llama.cpp/pull/28068), isolated by building with it reverted
+(75.6 / 108.3, i.e. reference speed restored). It recomposes the gated-delta-net L2 norm as
+`rms_norm(eps/n) · 1/√n` so epsilon is applied the way the reference implementation does, across
+`q_conv` and `k_conv` in all 48 GDN layers — two ops where there was one. Perplexity is unmoved
+(6.9218 vs 6.9211, ~1 % of one standard error), so the cost buys fidelity that wikitext cannot see.
+It stays: reverting would mean carrying a divergence from upstream on model correctness, forever,
+at every future hop. **A fused eps-aware `l2_norm` in ggml would recover most of the 5 % — that is
+the first thing this fork should try to upstream.**
 
 Decode is a tie; prefill is **+2.8 % at 32k** and +1.3-3.3 % on short prompts, with identical VRAM
 and **byte-identical greedy output**. `LLAMA_KV_ROW_PAD=256` measured null on this card and cost
