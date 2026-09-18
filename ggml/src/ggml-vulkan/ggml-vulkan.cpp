@@ -349,6 +349,48 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
     return range;
 }
 
+void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+    // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
+    // during this wait.
+    if (ctx->almost_ready_fence_pending) {
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence", ctx->device);
+        ctx->device->device.resetFences({ ctx->almost_ready_fence });
+        ctx->almost_ready_fence_pending = false;
+    }
+
+    // Spin (w/pause) waiting for the graph to finish executing.
+    vk::Result result;
+    for (;;) {
+        try {
+            result = ctx->device->device.getFenceStatus(ctx->fence);
+        } catch (vk::DeviceLostError &) {
+            ggml_vk_print_device_lost_info(ctx->device);
+            GGML_LOG_ERROR("ggml_vulkan: getFenceStatus at %s:%d\n", __FILE__, __LINE__);
+            throw;
+        }
+        if (result == vk::Result::eSuccess) {
+            break;
+        }
+        if (result != vk::Result::eNotReady) {
+            GGML_LOG_ERROR("ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+            throw vk::SystemError(vk::make_error_code(result), "ggml_vulkan: getFenceStatus");
+        }
+        for (uint32_t i = 0; i < 100; ++i) {
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+            YIELD();
+        }
+    }
+    ctx->device->device.resetFences({ ctx->fence });
+}
+
 static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
     static const char kDecodeVectorExt[] = "SPV_NV_cooperative_matrix_decode_vector";
 
