@@ -1,3 +1,128 @@
+# llama.cpp-rdna3
+
+**A llama.cpp fork for AMD RDNA3 / RDNA3.5 on Vulkan — Radeon RX 7900 XTX (gfx1100),
+RX 7800 XT (gfx1101) and Strix Halo / Ryzen AI Max+ 395 (gfx1151). Nothing else.**
+
+It exists because the two things this hardware needs have never been in one tree:
+
+1. **The ROCmFPx weight formats** — `Q4_0_ROCMFP4*`, `Q2/Q3/Q6/Q8_0_ROCMFPX` (ggml type ids
+   100-107), which stock llama.cpp cannot even *load*. They come from
+   [ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) (originally charlie12345/ROCmFPX) via
+   [LaurentZuijdwijk/llama.cpp](https://github.com/LaurentZuijdwijk/llama.cpp), which is the base
+   of this branch. On a 7900 XTX, Qwen3.8-27B at ROCmFP4-FAST decodes 33-38 % faster than the same
+   model as a Q4_K_M on stock llama.cpp, in 2.4 GiB less VRAM, for +4.3 % perplexity.
+2. **RDNA3 Vulkan work that was never upstreamed** — a body of measured patches that exists only as
+   patch files passed between community forks, with no pull request behind any of them. Carrying
+   them means carrying them ourselves.
+
+Upstream is where this should all live, and some of it is on its way there
+([#28898](https://github.com/ggml-org/llama.cpp/pull/28898) would put FP8/NVFP4 quant scales in ggml
+with a Vulkan implementation; [#27952](https://github.com/ggml-org/llama.cpp/pull/27952) brings int8
+coopmat1 MMQ to RDNA3). When it does, this fork should shrink, not grow.
+
+## What branch `rdna3` carries
+
+Base: `LaurentZuijdwijk/llama.cpp` @ `11bfe8a6` (upstream `0190529e`, 2026-08-30) — the ROCmFPx
+formats, the batch-3..8 mat-vec path, `--spec-draft-adaptive`, and the RADV ≥ 25.3 coopmat LDS pad
+gate. On top of that, six commits:
+
+| # | Patch | Author | Why it is here |
+|---|---|---|---|
+| 1 | `vulkan: hoist the coopmat1 FA P-fragment load out of the hsv_tile loop` | Nathan Wilson | coopmat1 flash-attention is the path RDNA3 actually takes |
+| 2 | `vulkan: store coopmat1 FA Psh query-major so the GEMM2 A load vectorizes` | Nathan Wilson | same |
+| 3 | `vulkan: pin a 32-wide subgroup for coopmat1 FA where narrowing is free` | Nathan Wilson | same |
+| 4 | `vulkan: fuse silu(x)*y into the existing swiglu-split pipeline` | Nathan Wilson | one less pass over the FFN activations |
+| 5 | `server: keep speculative checkpoints on device` | Gaetan Puleo | MTP speculative decoding is on for every model we run |
+| 6 | `llama: opt-in KV cache row padding to defeat power-of-2 channel aliasing` | Nathan Wilson | **opt-in, off by default** (`LLAMA_KV_ROW_PAD`); measured null on gfx1100, kept as a knob for gfx1151 |
+
+Every one of them is in the measured set below. **Nothing goes on this branch on inspection alone**
+— see "Tried and parked" for what happened the one time it did.
+
+Provenance: 1-3 and 5 are cherry-picked from
+[voidsurfer/llama.cpp-nudge](https://github.com/voidsurfer/llama.cpp-nudge) with original authorship
+intact; 4 and 6 come via [guevae2/paoai-strix-engine](https://github.com/guevae2/paoai-strix-engine),
+which had already rebased them onto this exact base. Every commit carries a `cherry picked from`
+line. All sources are MIT, as is this fork.
+
+## Tried and parked
+
+Two further patches by the same authors looked right on inspection — one numerical, one a
+correctness fix — and were carried on that basis. Measured on a 7900 XTX they cost **-23 % prose /
+-24 % json decode** against the six above, and changed the greedy output hash:
+
+| | prose | json | refactor | prefill @32k |
+|---|---|---|---|---|
+| patches 1-6 | 75.7 | 107.2 | 129.8 | 841.9 |
+| + FA MMQ fp32 narrowing + full MTP-rollback checkpoints | **58.4** | **80.5** | 120.2 | 806.4 |
+
+Draft acceptance went *up* (53 % vs 44 % on prose) while throughput fell, which points at the
+rollback path paying on every accepted token. They live on `carry/vulkan-fa-mmq-fp32` and
+`carry/mtp-full-checkpoints`, plus `test/fa-mmq-fp32` (= `rdna3` + the first of the two) so the pair
+can be bisected without disturbing the branch. Do not merge either without a benchmark.
+
+**Deliberately not carried:** everything DeepSeek-V4-specific (not run here), the DFlash2 draft-cache
+patches (DFlash2 loses to the baked MTP head on these cards, and it cannot be combined with it), the
+`mul_mat_id` IQ-type pipelines (second half of a two-commit series whose first half does not apply,
+and no IQ quant runs here), and anything already in the base — notably the RADV coopmat pad-2 driver
+gate, which is present and is worth ~11 % prefill on its own.
+
+## Measured
+
+7900 XTX (gfx1100), RADV / Mesa 26.2.2, Qwen3.8-27B ROCmFP4-FAST, 131k ctx, f16 K / q4_0 V, MTP n4,
+greedy, median of 2 — patches 1-6 against the same base without them:
+
+| | prose | json | refactor | prefill @32k |
+|---|---|---|---|---|
+| base (`11bfe8a6`) | 75.6 | 106.5 | 129.3 | 818.6 t/s |
+| **+ patches 1-6** | 75.7 | 107.2 | 129.8 | **841.9 t/s** |
+
+Decode is a tie; prefill is **+2.8 % at 32k** and +1.3-3.3 % on short prompts, with identical VRAM
+and **byte-identical greedy output**. `LLAMA_KV_ROW_PAD=256` measured null on this card and cost
+0.6 GiB, so leave it unset unless you are on gfx1151 and have measured otherwise.
+
+## Branches
+
+| Branch | What it is |
+|---|---|
+| `master` | untouched mirror of `ggml-org/llama.cpp`. Never commit here — it is what keeps "Sync fork" and every cross-fork compare working. |
+| `rdna3` | **default**, and what gets built. The base above plus the eight commits. |
+| `carry/*` | one branch per carried patch set, so a bad upstream rebase blows up in one place instead of all eight. |
+
+Rebasing onto current upstream is a **re-port, not a rebase**: since the fork point, upstream
+rewrote matmul pipeline creation into one spec-constant shader per quant family
+([#25773](https://github.com/ggml-org/llama.cpp/pull/25773)) and split the Vulkan sources into
+separate files ([#28732](https://github.com/ggml-org/llama.cpp/pull/28732)). Move the base up in
+steps and benchmark each one; do not try to land on master in a single jump.
+
+## Build
+
+Vulkan only — the ROCmFPx types ship no HIP kernels.
+
+```bash
+cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON \
+      -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+```
+
+Two invariants worth asserting in any build pipeline — if either fails, the tree has silently lost
+the reason it exists and is about to ship as a plain llama.cpp:
+
+```bash
+llama-quantize --help | grep -q Q4_0_ROCMFP4_FAST     # the ROCmFPx types
+llama-server   --help | grep -q -- --spec-draft-adaptive
+```
+
+Both binaries print help to **stdout and exit 1**, so capture before grepping under `pipefail`.
+
+In [SelfRef/llama-swap-docker-amd](https://github.com/SelfRef/llama-swap-docker-amd) this tree is the
+`llama-rdna3` stage and installs as `llama-server-rdna3`, `llama-cli-rdna3`, `llama-bench-rdna3`,
+`llama-quantize-rdna3`, `llama-perplexity-rdna3` (build args `WITH_RDNA3`, `RDNA3_REPO`,
+`RDNA3_BRANCH`, `RDNA3_COMMIT` — pin the commit).
+
+---
+
+*Everything below is the base fork's own README.*
+
 # llama.cpp – Adaptive Speculation + Fastest Vulkan on AMD Strix Halo
 
 **Adaptive speculative decoding that actually works**  
