@@ -95,11 +95,32 @@ and **byte-identical greedy output**. `LLAMA_KV_ROW_PAD=256` measured null on th
 | `rdna3` | **default**, and what gets built. The base above plus the eight commits. |
 | `carry/*` | one branch per carried patch set, so a bad upstream rebase blows up in one place instead of all eight. |
 
-Rebasing onto current upstream is a **re-port, not a rebase**: since the fork point, upstream
-rewrote matmul pipeline creation into one spec-constant shader per quant family
+## Roadmap: moving the base
+
+The base is 330 commits behind upstream, and catching up is a **re-port, not a rebase**: since the
+fork point upstream rewrote matmul pipeline creation into one spec-constant shader per quant family
 ([#25773](https://github.com/ggml-org/llama.cpp/pull/25773)) and split the Vulkan sources into
-separate files ([#28732](https://github.com/ggml-org/llama.cpp/pull/28732)). Move the base up in
-steps and benchmark each one; do not try to land on master in a single jump.
+separate files ([#28732](https://github.com/ggml-org/llama.cpp/pull/28732)).
+
+Measured merge cost from this branch, 2026-09-18:
+
+| merge target | conflicting files | conflict hunks |
+|---|---|---|
+| upstream just before #25773 (09-09) | 10 | 26 |
+| **at #25773** | 11 | **41** |
+| just before #28732 (09-17) | 12 | 44 |
+| current master (09-18) | 13 | 47 |
+
+So roughly **half the work is the single #25773 step**, and it is exactly where the ROCmFPx types
+have to be re-expressed in the new `create_mm_pipelines` / spec-constant scheme rather than merged.
+`ggml-vulkan.cpp` carries 28 of the 47 hunks at the far end; the rest are `qwen4exp.cpp` (4),
+`llama-memory-hybrid-idx.*` (5) and single hunks in converters, CMake and tests.
+
+Do it in those four steps, building and benchmarking each one against the table in "Measured" —
+a step that costs decode is a step to stop and understand, not to push through. The prize at the
+end is that this tree can take upstream PRs *and* the FP4 types at once, which is what the separate
+patched `llama-server` in [llama-swap-docker-amd](https://github.com/SelfRef/llama-swap-docker-amd)
+exists to work around today. Once it can, that binary goes back to being stock upstream.
 
 ## Build
 
