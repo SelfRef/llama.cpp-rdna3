@@ -2405,8 +2405,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
-        // members only, no trunk: graph_mtp builds its own single block
-        graph(const llama_model & model, const llm_graph_params & params, bool mtp);
+        struct no_build_t {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
+            llm_build_delta_net_base(params), model(model) {}
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
