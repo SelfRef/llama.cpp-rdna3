@@ -1651,6 +1651,18 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
 // ggml_vk_matmul_cm1_int_shmem_support's default case, and has its int paths disabled
 // wholesale. Measured 2026-09-18 on a 7900 XTX: that costs Qwen3.8-27B ROCmFP4-FAST
 // 42 % decode (75.0 -> 43.6 t/s) while the K-quants gain 10-27 % on short-prompt prefill.
+// Opt out of the #27952 cm1 int8 MMQ path (pipelines + warptile selection).
+//
+// The path helps models whose weights have a cm1 MMQ shader (the K-quants: measured +27 % on
+// short-prompt prefill for Qwen3.8-27B Q4_K_M). It HURTS a model with no such type: the
+// ROCmFP4-FAST build of the same model loses 30 % prefill and 37 % decode, but only with MTP
+// speculative decode on and only at a context that nearly fills the card. Same binary, one
+// env var, measured on a 7900 XTX 2026-09-18.
+static bool ggml_vk_no_cm1_mmq() {
+    static const bool off = getenv("GGML_VK_NO_CM1_MMQ") != nullptr;
+    return off;
+}
+
 static bool ggml_vk_type_has_cm1_mmq(ggml_type t) {
     switch (t) {
         case GGML_TYPE_Q4_0:   case GGML_TYPE_Q4_1:   case GGML_TYPE_Q5_0:
@@ -1998,7 +2010,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
 
-        const bool use_cm1_int = device->coopmat_int_support &&
+        const bool use_cm1_int = device->coopmat_int_support && !ggml_vk_no_cm1_mmq() &&
                                  (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
@@ -2619,7 +2631,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef X_CM1
 
-        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+        if (device->coopmat_int_support && (rdna3 || rdna4) && !ggml_vk_no_cm1_mmq()) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_Q4_1, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_1_q8_1",   matmul_q4_1_q8_1_cm1_len,   matmul_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3); }
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q5_0_q8_1",   matmul_q5_0_q8_1_cm1_len,   matmul_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
@@ -2693,7 +2705,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #undef X_CM1_ID
 
-        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+        if (device->coopmat_int_support && (rdna3 || rdna4) && !ggml_vk_no_cm1_mmq()) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_0_q8_1",   matmul_id_subgroup_q4_0_q8_1_cm1_len,   matmul_id_subgroup_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q4_1,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_1_q8_1",   matmul_id_subgroup_q4_1_q8_1_cm1_len,   matmul_id_subgroup_q4_1_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             cm1_create_mmq({GGML_TYPE_Q5_0,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_0_q8_1",   matmul_id_subgroup_q5_0_q8_1_cm1_len,   matmul_id_subgroup_q5_0_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
