@@ -1642,6 +1642,28 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
     return supported;
 }
 
+// Types that actually have a cm1 MMQ shader (#27952): the list the generator emits
+// mul_mmq_cm1.comp for, and that cm1_create_mmq registers pipelines for.
+//
+// This MUST gate the cm1 int warptile selection per type. use_cm1_int is a device property
+// (RDNA3/RDNA4 + coopmat_int), so without this check every OTHER type -- the ROCmFPx formats
+// here, Q2_0 and IQ3_S upstream -- also selects cm1 warptiles, then fails
+// ggml_vk_matmul_cm1_int_shmem_support's default case, and has its int paths disabled
+// wholesale. Measured 2026-09-18 on a 7900 XTX: that costs Qwen3.8-27B ROCmFP4-FAST
+// 42 % decode (75.0 -> 43.6 t/s) while the K-quants gain 10-27 % on short-prompt prefill.
+static bool ggml_vk_type_has_cm1_mmq(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q4_0:   case GGML_TYPE_Q4_1:   case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:   case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q3_K:   case GGML_TYPE_Q4_K:   case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:   case GGML_TYPE_NVFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     bool kscales2 = false;    // two scale sets per block
@@ -2014,22 +2036,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                      t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ3_S);
             const bool cm1_k_tile = (t == GGML_TYPE_Q3_K || t == GGML_TYPE_Q6_K ||
                                      t == GGML_TYPE_NVFP4);
+            // per type, not per device: see ggml_vk_type_has_cm1_mmq
+            const bool use_cm1_int_t = use_cm1_int && ggml_vk_type_has_cm1_mmq(t);
 
-            const auto & s_int   = use_cm1_int ? (cm1_k_tile ? s_warptile_mmq_cm1_int_k : s_warptile_mmq_cm1_int)
+            const auto & s_int   = use_cm1_int_t ? (cm1_k_tile ? s_warptile_mmq_cm1_int_k : s_warptile_mmq_cm1_int)
                                                : (is_k_quant  ? s_warptile_mmq_int_k     : s_warptile_mmq_int);
-            const auto & m_int   = use_cm1_int ? (cm1_k_tile ? m_warptile_mmq_cm1_int_k : m_warptile_mmq_cm1_int)
+            const auto & m_int   = use_cm1_int_t ? (cm1_k_tile ? m_warptile_mmq_cm1_int_k : m_warptile_mmq_cm1_int)
                                                : (is_k_quant  ? m_warptile_mmq_int_k     : m_warptile_mmq_int);
-            const auto & l_int   = use_cm1_int ? (cm1_k_tile ? l_warptile_mmq_cm1_int_k : l_warptile_mmq_cm1_int)
+            const auto & l_int   = use_cm1_int_t ? (cm1_k_tile ? l_warptile_mmq_cm1_int_k : l_warptile_mmq_cm1_int)
                                                : (is_k_quant  ? l_warptile_mmq_int_k     : l_warptile_mmq_int);
-            const auto & s_intid = use_cm1_int ? (cm1_k_tile ? s_warptile_mmq_cm1_int_k : s_warptile_mmq_cm1_int)
+            const auto & s_intid = use_cm1_int_t ? (cm1_k_tile ? s_warptile_mmq_cm1_int_k : s_warptile_mmq_cm1_int)
                                                : (is_k_quant  ? s_warptile_mmqid_int_k   : s_warptile_mmqid_int);
-            const auto & m_intid = use_cm1_int ? (cm1_k_tile ? m_warptile_mmq_cm1_int_k : m_warptile_mmq_cm1_int)
+            const auto & m_intid = use_cm1_int_t ? (cm1_k_tile ? m_warptile_mmq_cm1_int_k : m_warptile_mmq_cm1_int)
                                                : (is_k_quant  ? m_warptile_mmqid_int_k   : m_warptile_mmqid_int);
-            const auto & l_intid = use_cm1_int ? (cm1_k_tile ? l_warptile_mmq_cm1_int_k : l_warptile_mmq_cm1_int)
+            const auto & l_intid = use_cm1_int_t ? (cm1_k_tile ? l_warptile_mmq_cm1_int_k : l_warptile_mmq_cm1_int)
                                                : (is_k_quant  ? l_warptile_mmqid_int_k   : l_warptile_mmqid_int);
 
             const auto int_shmem_support = [&](const std::vector<uint32_t>& wt, bool id) {
-                return use_cm1_int ? ggml_vk_matmul_cm1_int_shmem_support(device, wt, id, t)
+                return use_cm1_int_t ? ggml_vk_matmul_cm1_int_shmem_support(device, wt, id, t)
                                    : ggml_vk_matmul_int_shmem_support(device, wt, id, t);
             };
 
