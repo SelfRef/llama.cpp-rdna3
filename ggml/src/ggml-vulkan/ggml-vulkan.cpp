@@ -18034,40 +18034,6 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         return false;
     }
 
-    // GGML_VK_FUSE_UNARY_MUL=1: the delta-net path emits silu(x)*y as two nodes, so the silu
-    // result makes a full round trip through memory. That is the same shape the swiglu split
-    // already computes in one pass, so route the pair to the existing GLU pipeline.
-    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
-        static const bool enabled = [] {
-            const char * e = getenv("GGML_VK_FUSE_UNARY_MUL");
-            return e && atoi(e) != 0;
-        }();
-        if (!enabled) {
-            return false;
-        }
-        const ggml_tensor * unary = cgraph->nodes[node_idx];
-        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
-
-        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU) {
-            return false;
-        }
-        if (mul->src[0] != unary && mul->src[1] != unary) {
-            return false;
-        }
-        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
-        // The GLU split shader walks both inputs and the output with the same element count.
-        if (unary->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
-            return false;
-        }
-        if (!ggml_are_same_shape(unary, other) || !ggml_are_same_shape(unary, mul)) {
-            return false;
-        }
-        if (!ggml_is_contiguous(unary->src[0]) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) {
-            return false;
-        }
-        return true;
-    }
-
     if ((ops.size() == 2 || ops.size() == 3 || ops.size() == 4) &&
         ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
         // additional constraints specific to this fusion
@@ -18169,37 +18135,6 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
                 return false;
             }
         }
-    }
-
-    // EXPERIMENT (GGML_VK_FUSE_UNARY_MUL=1): silu(x)*y is emitted as two nodes by the delta-net
-    // path, so the silu result makes a full round trip through memory. That is the same shape
-    // swiglu-split already computes in one pass, so route the pair to the existing GLU pipeline.
-    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
-        static const char * env = getenv("GGML_VK_FUSE_UNARY_MUL");
-        if (!(env && atoi(env) != 0)) {
-            return false;
-        }
-        const ggml_tensor * unary = cgraph->nodes[node_idx];
-        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
-
-        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU) {
-            return false;
-        }
-        if (mul->src[0] != unary && mul->src[1] != unary) {
-            return false;
-        }
-        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
-        // The GLU split shader walks both inputs and the output with the same element count.
-        if (unary->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
-            return false;
-        }
-        if (!ggml_are_same_shape(unary, other) || !ggml_are_same_shape(unary, mul)) {
-            return false;
-        }
-        if (!ggml_is_contiguous(unary->src[0]) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) {
-            return false;
-        }
-        return true;
     }
 
     auto const &mmid_mul_ok = [&](const ggml_tensor *mmid, const ggml_tensor *mul) {
@@ -18983,9 +18918,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ID_MUL";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
-                ctx->num_additional_fused_ops = 1;
-                fusion_string = "SILU_MUL";
             } else if (ggml_can_fuse_subgraph(cgraph, i, rms_norm_mul_rope_view_set_rows_pattern, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
