@@ -559,7 +559,12 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
         if (buf_ib < BM) {                                                                      \
             const uint ib = pos_a_ib + buf_ib * p.stride_a / BK;                                \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                pre_a[li * BK_STEP + ks] = block_a_load(ib + ks, loadr_a);                      \
+                /* K need not be a multiple of BK*BK_STEP: a k-step past end_k re-reads the  */ \
+                /* row's first block (finite), and its B side is zeroed, so it adds nothing. */ \
+                /* Reading on past the row instead picks up the next row, or bytes after the */ \
+                /* tensor whose f16 scale can be NaN.                                         */ \
+                const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
+                pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
             }                                                                                   \
         }                                                                                       \
     }                                                                                           \
