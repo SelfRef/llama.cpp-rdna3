@@ -50,3 +50,16 @@ Local qwen4exp extensions to re-express on upstream's structure:
 ## Verified compat
 GGUF KV key strings ("{arch}.ple.*") unchanged by the upstream rename - existing
 converted files still load.
+
+## 2026-09-19 follow-up (GMK box): what the re-port had lost, now restored
+The four "needs design decisions" files were resolved in the 09-18 merge by taking upstream's
+qwen4exp structure, which dropped three of the local extensions listed above while keeping their
+declarations (models.h still had graph_mtp, ple_ngram_embd and ple_disk; llama-ple-disk.cpp still
+compiled). Restored, each verified by loading a real file on gfx1151:
+  MTP draft head          -> upstream PR #28243 merged (50b7773f9); acceptance 0.38-0.94 on Flash-Next
+  QSA pooled-key cache    -> upstream PR #28699 merged (d86e5b648); cache built, output identical on/off
+  per-head PLE split      -> re-expressed from fpx 11bfe8a63 (load ple_ngram_embd.N, local row index,
+                             one gather per head + concat); agentionai ROCmFP4-FAST ple16 file loads
+  PLE-on-disk / sidecar   -> re-expressed from fpx (ple_disk in load_arch_tensors, embd input path);
+                             unsloth UD-Q2_K_XL joined table with --ngram-on-disk: 1312 preads / 32 tok
+Still not re-checked: "non-unified indexer cache".

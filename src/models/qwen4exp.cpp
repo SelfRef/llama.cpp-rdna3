@@ -2,6 +2,9 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ple-disk.h"
+#include "ggml-cpp.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -193,18 +196,91 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
         }
 
-        // the converter pads the table; a model synthesised from metadata has no tensor to ask
-        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+        // The table ships either joined (upstream layout, one tensor) or one tensor per head
+        // (ple_ngram_embd.N, the ROCmFPx layout: each head is small enough to be a device
+        // buffer, so the whole table can live in VRAM). build_inp_ple reads both the same way.
+        // the converter pads the joined table; a model synthesised from metadata has no tensor to ask
+        const std::string ple_name  = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        const std::string head_name = tn(LLM_TENSOR_PLE_NGRAM_EMBD, "weight", 0).str();
+        if (params.path_ple) {
+            // The table lives in its own GGUF, so different tables (precision, size, source)
+            // can be tried without requantizing the rest of the model. This only needs one
+            // tensor's shape, type and file offset, so read it with the raw GGUF API rather
+            // than standing up a second llama_model_loader for a whole file.
+            struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context_ptr ctx_ple { gguf_init_from_file(params.path_ple, gp) };
+            if (!ctx_ple) {
+                throw std::runtime_error(format("--model-ple: failed to open '%s'", params.path_ple));
+            }
+
+            const int64_t tid = gguf_find_tensor(ctx_ple.get(), ple_name.c_str());
+            if (tid < 0) {
+                throw std::runtime_error(format("--model-ple: '%s' has no %s tensor "
+                                                "(the sidecar must use the joined table layout)",
+                                                params.path_ple, ple_name.c_str()));
+            }
+
+            const int64_t * ne      = gguf_get_tensor_ne(ctx_ple.get(), tid);
+            const ggml_type pe_type = gguf_get_tensor_type(ctx_ple.get(), tid);
+
+            if (ne[0] != (int64_t) hparams.ple_head_dim) {
+                throw std::runtime_error(format("--model-ple: row width %" PRId64 " in '%s' does not match "
+                                                "this model's PLE head dim %u", ne[0], params.path_ple, hparams.ple_head_dim));
+            }
+            if (ne[1] < ple_rows) {
+                throw std::runtime_error(format("--model-ple: '%s' has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                params.path_ple, ne[1], ple_rows));
+            }
+            ple_rows = ne[1];
+
+            const size_t offs = gguf_get_data_offset(ctx_ple.get()) + gguf_get_tensor_offset(ctx_ple.get(), tid);
+
+            llama_ple_disk::params dp;
+            dp.n_threads   = params.ple_io_threads;
+            dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
+            dp.direct_io   = params.ple_direct_io;
+            ple_disk = std::make_shared<llama_ple_disk>(params.path_ple, offs, pe_type, ne[0], ple_rows, dp);
+            LLAMA_LOG_INFO("%s: PLE n-gram table read from sidecar '%s': %s\n",
+                            __func__, params.path_ple, ple_disk->describe().c_str());
+
+            // register with the main loader too, in case this file also carries a copy:
+            // NOT_REQUIRED means either way is fine, SKIP means its bytes are never touched
+            create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), { hparams.ple_head_dim, ple_rows },
+                          TENSOR_SKIP | TENSOR_NOT_REQUIRED);
+        } else if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
             if (ple_w->tensor->ne[1] < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
             }
             ple_rows = ple_w->tensor->ne[1];
+
+            if (params.ple_on_disk) {
+                // Counted as created but never allocated, mapped or read: each ubatch preads its
+                // rows straight from the file. Only the joined layout has one tensor to read from.
+                llama_ple_disk::params dp;
+                dp.n_threads   = params.ple_io_threads;
+                dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
+                dp.direct_io   = params.ple_direct_io;
+                ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
+                                                            ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
+                LLAMA_LOG_INFO("%s: PLE n-gram table stays on disk: %s\n", __func__, ple_disk->describe().c_str());
+                create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
+            }
+        } else if (ml.get_weight(head_name.c_str()) != nullptr) {
+            if (params.ple_on_disk) {
+                LLAMA_LOG_INFO("%s: --ngram-on-disk ignored: this file stores the n-gram table per head, which offloads\n", __func__);
+            }
+            ple_ngram_embd.resize(hparams.ple_n_heads);
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                ple_ngram_embd[h] = create_tensor(tn(LLM_TENSOR_PLE_NGRAM_EMBD, "weight", h),
+                                                  { hparams.ple_head_dim, (int64_t) hparams.ple_head_vocab_sizes[h] }, 0);
+            }
         }
 
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        if (ple_ngram_embd.empty() && !ple_disk) {
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        }
     }
 
     const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
@@ -1464,10 +1540,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return pmodel.ple_disk ? (embd != nullptr && embd->ne[1] == n) : (rows != nullptr && rows->ne[0] == n);
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
+
+    std::vector<float> embd_buf;
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1499,6 +1579,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t n_prev   = n_gram - 1;
 
     std::vector<int32_t> idx(n_heads * n_tokens);
+
+    const bool split = !pmodel.ple_ngram_embd.empty();
 
     GGML_ASSERT(mctx != nullptr);
 
@@ -1532,15 +1614,27 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             const int64_t base = (n - 2) * per_gram;
             for (int64_t g = 0; g < per_gram; ++g) {
                 const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+                // per-head tables are indexed locally from row 0; the joined table is one row
+                // space, so its rows carry the head's offset
+                const uint64_t local = mixed % hp.ple_head_vocab_sizes[h_i];
+                idx[i * n_heads + h_i] = (int32_t) (split ? local : local + hp.ple_head_offsets[h_i]);
             }
         }
     }
 
-    // the table stays host side and is read by 16 gathers per token, no two on the same page.
+    // a joined table stays host side and is read by 16 gathers per token, no two on the same page.
     // queued here they are in flight before the graph runs
-    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+    if (!split) {
+        pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+    }
+
+    if (pmodel.ple_disk) {
+        GGML_ASSERT(embd != nullptr && rows == nullptr);
+        embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
+        pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
+        ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        return;
+    }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
@@ -1609,13 +1703,43 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
+    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does.
+    // Three sources give the same bytes: rows read straight from the file when the joined table stays
+    // on disk, one gather per head when the table is split, or one gather with the head carried in
+    // the row index when it is joined and resident.
+    const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
+
+    ggml_tensor * emb = nullptr;
+    if (qmodel.ple_disk) {
+        // set_input gathers the rows from the file and hands them over as F32, in the shape
+        // the get_rows below would have produced
+        ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        ggml_set_input(ple_inp->embd);
+        emb = ple_inp->embd;
+        res->add_input(std::move(ple_inp));
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        cb(emb, "ple_embd", -1);
+        return emb;
+    }
+
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
     res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    if (!qmodel.ple_ngram_embd.empty()) {
+        // rows is [n_heads, n_tokens] (head fastest, matching set_input's idx[i*n_heads+h]);
+        // pick head h's index for every token as a strided view, then gather that head's table
+        ggml_tensor * rows2d = ggml_reshape_2d(ctx0, rows, n_heads, n_tokens);
+        for (int64_t h = 0; h < n_heads; ++h) {
+            ggml_tensor * idx_h = ggml_view_2d(ctx0, rows2d, 1, n_tokens, rows2d->nb[1], h * rows2d->nb[0]);
+            idx_h = ggml_reshape_1d(ctx0, ggml_cont(ctx0, idx_h), n_tokens);
+            ggml_tensor * emb_h = ggml_get_rows(ctx0, qmodel.ple_ngram_embd[h], idx_h);
+            emb = emb ? ggml_concat(ctx0, emb, emb_h, 0) : emb_h;
+        }
+    } else {
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
