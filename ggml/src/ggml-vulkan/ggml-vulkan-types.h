@@ -763,6 +763,10 @@ struct vk_device_struct {
     bool device_fault {};
     PFN_vkGetDeviceFaultInfoEXT pfn_vkGetDeviceFaultInfoEXT {};
 
+    // set when the device is lost
+    // once set, graph_compute returns GGML_STATUS_FAILED until the backend is recreated
+    bool device_lost {};
+
     bool serialize_submissions {};
 
     const ggml_cgraph * diag_cgraph {};
