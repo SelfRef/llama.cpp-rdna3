@@ -8099,7 +8099,11 @@ bool ggml_vk_use_mul_mat_vec_id(const ggml_backend_vk_context * ctx, const struc
     ggml_tensor * src2 = dst->src[2];
 
     bool use_vec_id = src2->ne[1] <= 8;
-    if (!ctx->device->coopmat2) {
+    // #27332's density gate was measured on an integrated RDNA3.5 part. On a
+    // discrete RDNA3 card it does the opposite: Qwen3.6-35B-A3B decode with an
+    // MTP draft lands in the widened vector range and loses 47 % (gfx1100,
+    // 2026-09-19), so discrete devices keep upstream's plain batch limit.
+    if (!ctx->device->coopmat2 && ctx->device->uma) {
         // Tiled mul_mat_id is slow at low batch without coopmat2; keep the
         // vector path while the routed density is low.
         const int64_t n_tokens  = src2->ne[1];
