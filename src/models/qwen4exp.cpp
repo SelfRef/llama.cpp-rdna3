@@ -543,11 +543,17 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_attn_inject,
                 &inject, il);
 
-        ggml_build_forward_expand(gf, cur);
-
         if (hparams.is_recr(il)) {
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+
+            // build_layer_attn_linear() adds the GDN state cache writes as sink nodes. Close the
+            // branch after them, as qwen35moe does: expanding at the mixed input left those writes
+            // ordered against the wrong node set and the recurrent state raced the next layer
+            // (upstream #22661).
+            ggml_build_forward_expand(gf, cur);
         } else {
+            ggml_build_forward_expand(gf, cur);
+
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
