@@ -362,9 +362,25 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
-        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
-        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
+        // A draft-only export from the ROCmFPx fork stores the MTP head's hyper-connection
+        // mixer under the trunk names (output_hc_*), since that file has no trunk of its own.
+        // Take those when the nextn.* copies are missing; they are the same weights.
+        const bool legacy_head = mtp_only && ml.get_weight(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il).str().c_str()) == nullptr;
+        const int  head_flags  = legacy_head ? flags | TENSOR_NOT_REQUIRED : flags;
+
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, head_flags | TENSOR_ALLOW_RESHAPE);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, head_flags);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, head_flags);
+
+        if (legacy_head && layer.nextn.hc_head_norm == nullptr) {
+            if (hc_head_norm == nullptr || hc_head_down == nullptr || hc_head_up == nullptr) {
+                throw std::runtime_error("MTP draft has neither nextn.hc_head_* nor output_hc_* tensors");
+            }
+            layer.nextn.hc_head_norm = hc_head_norm;
+            layer.nextn.hc_head_down = hc_head_down;
+            layer.nextn.hc_head_up   = hc_head_up;
+            LLAMA_LOG_INFO("%s: MTP head uses the file's output_hc_* mixer (ROCmFPx draft-only layout)\n", __func__);
+        }
 
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
