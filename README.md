@@ -176,13 +176,40 @@ two conflict in one hunk each and need a rebase onto this tree:
 
 | PR | what it is | state |
 |---|---|---|
-| #27952 | int8 coopmat1 MMQ for RDNA3 — the measured RDNA3 prefill win (+4.6 % dense / +18.5 % MoE) | 1 hunk vs master, in the int-shmem warptile selection |
+| #27952 | int8 coopmat1 MMQ for RDNA3 — a prefill win on entries without an MTP draft, a decode loss on entries with one (see phase 3) | 1 hunk vs master, in the int-shmem warptile selection |
 | #25666 | no MMVQ on speculative-decode steps — `qwen38-bart`'s draft acceptance | 1 hunk vs master, a device-tuning constant block |
 | #28243 | Qwen3.8-Flash-Next MTP head | the image's local `28243-rebased.patch` no longer applies (2 of 19 files), but the PR head itself now merges cleanly — use the PR ref |
 
 Once those land here, `llama-server` in the image goes back to byte-for-byte upstream and this fork is
 the one binary for every entry. Not before: that order was chosen so no production entry ever sees a
 regression window.
+
+## Phase 3: four more upstream PRs, and what the cm1 knob actually keys on
+
+Branch `carry/phase3`, 2026-09-19, all four measured on a 7900 XTX (gfx1100) before being kept:
+
+| PR | what it is | verdict |
+|---|---|---|
+| #27183 | return `GGML_STATUS_FAILED` on Vulkan device loss instead of aborting | **kept.** Hand-resolved against the source split: the PR still carries pre-split copies of the device structs, so only its four real hunks were taken and `device_lost` went into `ggml-vulkan-types.h`. A lost device now fails the request instead of killing the server. |
+| #28873 | honour `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` in `llama_kv_cache::state_write`/`state_read_sinfo` | **kept.** Clean merge. On Qwen3.8-27B with `--ctx-checkpoints 64` it takes **2.1 GB off the resident footprint** with a byte-identical output hash — a full-attention cache no longer serialises itself into every checkpoint. |
+| #29019 | preserve batch order for layer inputs and unmasked NextN embeddings | **merged, then reverted.** It merges clean and the ordering bug it fixes is real, but on Qwen3.6-35B-A3B it costs **57 % of decode** (146.2 -> 62.3 t/s prose, 181.9 -> 79.6 json) with the same output hash *and* the same draft acceptance, so it buys nothing measurable here. Qwen3.8-27B — dense, same MTP, same `--parallel 2` — is untouched, so the cost scales with graph size. Can come back in a cheaper shape. |
+| #27332 | density gate for `MUL_MAT_VEC_ID` on non-coopmat2 devices | **narrowed to `device->uma`** (`c401947ca`). As written it costs **47 % of decode** on Qwen3.6-35B-A3B here (121.6 -> 64.7 t/s prose, same output hash): the widened vector range catches the MTP draft-verify batch, which a discrete card runs faster on the tiled path. Upstream measured +36 % on gfx1151, so the gate stays for integrated parts. |
+
+The same session also corrected what `GGML_VK_NO_CM1_MMQ` is for. The 09-18 rule was "ROCmFPx
+entries only"; both arms on one binary say the discriminator is **the MTP draft**, not the weight
+format:
+
+| entry | MTP | quant | cm1 |
+|---|---|---|---|
+| gemma4 | no | UD-Q4_K_XL | **on** — +9 % prose / +29 % json prefill, decode flat |
+| ling3 | no | UD-Q4_K_XL | **on** — +19 % / +22 % prefill, decode flat |
+| qwen36 | yes | UD-Q4_K_M | **off** — cm1 costs 17-21 % decode |
+| qwen38-fast | yes | ROCmFP4-FAST | **off** — cm1 costs 30 % prefill, 37 % decode (09-18) |
+
+This also supersedes the "+18.5 % MoE" figure in the phase 2 table: qwen36 decode was flat under cm1
+on 09-18 and is -17 % now. The only cm1-touching commit in between is `aa5e52e44` (clamp the A
+prefetch to `end_k`), which added a per-prefetch select inside the unrolled load. That is an untested
+hypothesis and it matters, because the clamp is a correctness fix the Strix Halo peer needs.
 
 ## Build
 
