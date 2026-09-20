@@ -164,13 +164,13 @@ have to be re-expressed in the new `create_mm_pipelines` / spec-constant scheme 
 Do it in those four steps, building and benchmarking each one against the table in "Measured" —
 a step that costs decode is a step to stop and understand, not to push through. The prize at the
 end is that this tree can take upstream PRs *and* the FP4 types at once, which is what the separate
-patched `llama-server` in [llama-swap-docker-amd](https://github.com/SelfRef/llama-swap-docker-amd)
+patched `llama-server` in [llama-swap-rdna](https://github.com/SelfRef/llama-swap-rdna)
 exists to work around today. Once it can, that binary goes back to being stock upstream.
 
 ## Phase 2: one binary
 
 With the base at master, the tree can take upstream PRs — the thing the separate patched `llama-server`
-in [llama-swap-docker-amd](https://github.com/SelfRef/llama-swap-docker-amd) exists to work around.
+in [llama-swap-rdna](https://github.com/SelfRef/llama-swap-rdna) exists to work around.
 Measured against master on 2026-09-18, of that image's 13 `LLAMA_PATCHES` **eleven merge cleanly**;
 two conflict in one hunk each and need a rebase onto this tree:
 
@@ -235,7 +235,7 @@ For anything not specific to this fork — general build options, the server's f
 follow [upstream's documentation](https://github.com/ggml-org/llama.cpp): this tree only adds the
 RDNA3 pieces described above and is otherwise current master.
 
-In [SelfRef/llama-swap-docker-amd](https://github.com/SelfRef/llama-swap-docker-amd) this tree is the
+In [SelfRef/llama-swap-rdna](https://github.com/SelfRef/llama-swap-rdna) this tree is the
 `llama-rdna3` stage and installs as `llama-server-rdna3`, `llama-cli-rdna3`, `llama-bench-rdna3`,
 `llama-quantize-rdna3`, `llama-perplexity-rdna3` (build args `WITH_RDNA3`, `RDNA3_REPO`,
 `RDNA3_BRANCH`, `RDNA3_COMMIT` — pin the commit).
