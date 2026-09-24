@@ -17,14 +17,14 @@ It exists because the two things this hardware needs have never been in one tree
 
 Upstream is where this should all live, and some of it is on its way there
 ([#28898](https://github.com/ggml-org/llama.cpp/pull/28898) would put FP8/NVFP4 quant scales in ggml
-with a Vulkan implementation; [#27952](https://github.com/ggml-org/llama.cpp/pull/27952) brings int8
-coopmat1 MMQ to RDNA3). When it does, this fork should shrink, not grow.
+with a Vulkan implementation; [#27952](https://github.com/ggml-org/llama.cpp/pull/27952), int8
+coopmat1 MMQ for RDNA3, merged on 2026-09-24). When it does, this fork should shrink, not grow.
 
 ## What branch `rdna3` carries
 
 Base: `LaurentZuijdwijk/llama.cpp` @ `11bfe8a6` (upstream `0190529e`, 2026-08-30) — the ROCmFPx
 formats, the batch-3..8 mat-vec path, `--spec-draft-adaptive`, and the RADV ≥ 25.3 coopmat LDS pad
-gate — and, since 2026-09-18, **upstream master itself**: the re-port is complete, the fork is no longer behind.
+gate — and, since 2026-09-18, **upstream master itself** (last merged 2026-09-24, `8212c780`): the re-port is complete, the fork is no longer behind.
 On top of upstream there are five carried patches (the swiglu fusion was dropped once upstream's #27220
 superseded it) plus the fork's own ROCmFPx type plumbing, its delta-net concat-transpose kernel, and the
 UMA readback guard:
@@ -176,7 +176,7 @@ two conflict in one hunk each and need a rebase onto this tree:
 
 | PR | what it is | state |
 |---|---|---|
-| #27952 | int8 coopmat1 MMQ for RDNA3 — a prefill win on entries without an MTP draft, a decode loss on entries with one (see phase 3) | 1 hunk vs master, in the int-shmem warptile selection |
+| #27952 | int8 coopmat1 MMQ for RDNA3 — a prefill win on entries without an MTP draft, a decode loss on entries with one (see phase 3) | **merged upstream 2026-09-24**; the fork keeps only its per-type gate, `GGML_VK_NO_CM1_MMQ` and the A-side `end_k` clamp (see the 09-24 round) |
 | #25666 | no MMVQ on speculative-decode steps — `qwen38-bart`'s draft acceptance | 1 hunk vs master, a device-tuning constant block |
 | #28243 | Qwen3.8-Flash-Next MTP head | the image's local `28243-rebased.patch` no longer applies (2 of 19 files), but the PR head itself now merges cleanly — use the PR ref |
 
@@ -210,6 +210,46 @@ This also supersedes the "+18.5 % MoE" figure in the phase 2 table: qwen36 decod
 on 09-18 and is -17 % now. The only cm1-touching commit in between is `aa5e52e44` (clamp the A
 prefetch to `end_k`), which added a per-prefetch select inside the unrolled load. That is an untested
 hypothesis and it matters, because the clamp is a correctness fix the Strix Halo peer needs.
+
+## Maintenance round 2026-09-24
+
+Base moved to upstream master `8212c780` (2026-09-24). Merge cost: 3 files, 15 hunks, almost all of
+them #27952 arriving in its final upstream form on top of the older head this branch carried.
+After the merge the coopmat1 MMQ shaders are upstream's byte for byte except one hunk. Upstream's
+prefetch clamps only the **B** side to `end_k`, so the fork keeps its **A**-side clamp: a k-step past
+the end of a row would otherwise read the next row, or the bytes after the tensor, whose f16
+scale can be NaN (NaN × a zeroed B is still NaN). The per-type cm1 gate (`ggml_vk_type_has_cm1_mmq`,
+13 types, which matches the generator exactly) and `GGML_VK_NO_CM1_MMQ` are still needed, because
+upstream still selects cm1 warptiles per device rather than per type.
+
+| change | what | verdict |
+|---|---|---|
+| #28956, #28927, #28243 | carried PRs whose authors pushed since the last merge (exact A/B descriptor ranges in `mul_mm`; a clean-up; review fixes + rebase) | new heads merged |
+| #28943 | HIP masked-KV-tile skip | **reverted**: closed upstream without merge, and HIP code this Vulkan-only tree never builds |
+| #29019 | batch-order fix (reverted in phase 3) | stays out: the author's update only strips unrelated files, nothing addresses the measured MoE cost |
+| #29182 | MoE-aware `mul_mat_id` tile selection | **rejected, −12 % prefill**: Qwen3.6-35B-A3B at 32k, 1911 → 1679 t/s, same output hash. At `-ub 256` with top-8 of 256 experts the per-expert row count is exactly 8, so every expert matmul drops from the aligned large tile to the unaligned small one. Upstream measured +10 % on gfx1151; the discrete card pays for it. |
+| #29280 | reuse Vulkan descriptor sets when bindings are unchanged | **not carried, neutral**: decode within ±1 % on both a dense 27B and the 35B MoE under MTP. RADV's descriptor updates are evidently cheap enough that skipping them buys nothing measurable. |
+| Nathan Wilson's gfx11 coopmat GEMM rewrite (via paoai-strix-engine) | f32 accumulator, register prefetch of the next K tile, 8-wide q6_K/q3_K/q8_0/q5_0 loaders; +3..21 % prefill on gfx1151 with a 27B FP4 | **deferred, needs a re-port**: written against the pre-#25773 per-type loaders and the f16-B/wave32 knobs this branch dropped, so it does not cherry-pick (5 files, 12 hunks). Three independent parts, only measured as a bundle on gfx1151. |
+
+What the base move itself did, on a 7900 XTX (greedy, same session as the reference):
+
+| | prose | json | refactor | prefill @32k | output |
+|---|---|---|---|---|---|
+| Qwen3.8-27B ROCmFP4-FAST, MTP n4, before | 75.9 | 107.6 | 131.2 | 855.3 (mean of 3 runs) | — |
+| same, after | 77.0 | 108.1 | 131.9 | 846.4 (mean of 2) | byte-identical |
+| Qwen3.6-35B-A3B UD-Q4_K_M, MTP, before | 166.7 | 190.4 | — | 1910.8 | — |
+| same, after | 166.7 | **203.8** | — | 1913.7 | byte-identical |
+
+Decode is a tie or better (+7 % json on the MoE); the dense model's 32k prefill is −1.0 %, which is
+on the noise line. **Output changes on every file that carries IQ4_XS tensors, and only on those**
+(a Qwen3.8-27B UD-Q4_K_XL with 61 of them, Qwen3.5-4B UD-Q4_K_XL with 10 on the 7800 XT). The cause is
+upstream #28415, now in master, which gives IQ4_XS its own q8_1 integer-dot MMQ/MMV path. An earlier
+revision of that PR produced subtly broken text on RDNA3 (clauses dropped mid-sentence, draft
+acceptance *rising*), so it was checked by reading the output. The current form reads coherent, with
+free-form draft acceptance unchanged (57 → 58 %). The 4B's speed is flat. On the 27B the greedy
+texts differ, so per-preset decode is not comparable run to run: prose +8 %, json −12 % (its draft
+acceptance fell 92 → 66 % on a different answer), refactor +11 %, identical output on refactor.
+Check the text again on any IQ4_XS-heavy quant after the next move.
 
 ## Build
 
